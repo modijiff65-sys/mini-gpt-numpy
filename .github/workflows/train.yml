@@ -1,0 +1,64 @@
+name: mini-gpt training loop
+
+# The jugaad: GitHub gives every repo free CI compute. On a PUBLIC repo that
+# compute is unlimited, and the runner is 4 vCPU / 16 GB RAM (about 8x the RAM
+# of a small sandbox, and much faster). This workflow trains the model in the
+# cloud and commits the updated checkpoint back, so the loop never loses
+# progress and nothing has to run on your own machine.
+
+on:
+  workflow_dispatch: {}          # run by hand from the Actions tab
+  schedule:
+    - cron: '*/15 * * * *'       # every 15 minutes (GitHub's own cron; min is 5 min)
+
+permissions:
+  contents: write                # needed so the job can commit the checkpoint back
+
+concurrency:
+  group: mini-gpt-train          # never run two training jobs at once
+  cancel-in-progress: false      # queue instead of cancelling
+
+jobs:
+  train:
+    runs-on: ubuntu-latest       # 4 vCPU, 16 GB RAM, 14 GB SSD
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install numpy
+        run: pip install --quiet numpy
+
+      - name: Get the corpus (only if missing)
+        run: |
+          if [ ! -f shakespeare.txt ]; then
+            curl -sL https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt -o shakespeare.txt
+          fi
+          wc -c shakespeare.txt
+
+      - name: Sanity-check the gradients
+        run: python test_grad.py
+
+      - name: Train one resumable chunk
+        run: python mini_ai.py train --resume --steps 100000 --max_seconds 780 --save_every 200 --log_every 200
+
+      - name: Report progress
+        run: |
+          python - <<'PY'
+          import json, numpy as np
+          z = np.load('ckpt.npz')
+          L = json.load(open('loss_log.json'))
+          print(f"step {int(z['meta::step'][0])} | latest train {L[-1]['train']} | val {L[-1]['val']}")
+          PY
+
+      - name: Commit checkpoint back to the repo
+        run: |
+          git config user.name  "mini-gpt-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add ckpt.npz loss_log.json
+          STEP=$(python -c "import numpy as np;print(int(np.load('ckpt.npz')['meta::step'][0]))")
+          git commit -m "train: step ${STEP}" || echo "nothing new to commit"
+          git push
